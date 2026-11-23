@@ -6,7 +6,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$HOME/.claude/hooks/block_risky_push.py\""
+            "command": "f=\"$HOME/.claude/hooks/block_risky_push.py\"; [ -f \"$f\" ] || { echo \"guardrails hook missing: $f\" >&2; exit 1; }; exec python3 \"$f\"",
+            "timeout": 10,
+            "statusMessage": "guardrails: checking git push"
           }
         ]
       }
