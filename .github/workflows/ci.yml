@@ -1,0 +1,258 @@
+# Reusable guardrails workflow. Callers use templates/caller.yml.
+# Pull request: common + python + gate. Schedule or manual run: codeql + mutation.
+# The only required check in the ruleset is "ci / gate".
+name: guardrails
+
+on:
+  workflow_call:
+    inputs:
+      python:
+        description: Run the Python checks. The repo needs pyproject.toml and uv.lock.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # Pinned tool versions. Each one was at least 7 days old when picked.
+  UV_VERSION: "0.13.8"
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  RUFF_VERSION: "0.17.5"
+  MYPY_VERSION: "2.4.1"
+  COVERAGE_VERSION: "7.17.3"
+  DIFF_COVER_VERSION: "11.0.2"
+  PIP_AUDIT_VERSION: "2.10.1"
+  MUTMUT_VERSION: "3.8.1"
+  DIFF_COVERAGE_MIN: "80"
+
+jobs:
+  common:
+    name: common
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Get the guardrails checks
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: designed7000/guardrails
+          ref: ${{ github.repository == 'designed7000/guardrails' && github.sha || 'v1' }}
+          path: .guardrails
+          persist-credentials: false
+
+      # HEAD is the PR merge commit: HEAD^1 is the base branch, HEAD^2 is the PR head.
+      - name: Diff checks (files, data, suppressions, CI changes, size)
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          SELF_REPO: ${{ github.repository == 'designed7000/guardrails' }}
+        run: |
+          args=(--base HEAD^1 --head HEAD --labels "$LABELS")
+          if [ "$SELF_REPO" = true ]; then args+=(--self-repo); fi
+          python3 .guardrails/checks/diff_checks.py "${args[@]}"
+
+      - name: Secret scan (gitleaks) on the PR commits
+        if: ${{ !cancelled() }}
+        run: |
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" "$url"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git --no-banner --redact --log-opts="HEAD^1..HEAD^2" .
+
+  python:
+    name: python
+    if: github.event_name == 'pull_request' && inputs.python
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Write helper files
+        run: |
+          # tool NAME VERSION ARGS...: the project's own tool if it has one, else the pinned one.
+          cat > "$RUNNER_TEMP/tool" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          name="$1"; version="$2"; shift 2
+          if [ -x ".venv/bin/$name" ]; then exec uv run --no-sync "$name" "$@"; fi
+          exec uv run --no-sync --with "$name==$version" "$name" "$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/tool"
+          # Measure every Python file, also files no test imports, so new untested code shows.
+          cat > "$RUNNER_TEMP/coveragerc" <<'EOF'
+          [run]
+          source = .
+          omit =
+              .venv/*
+              tests/*
+              **/test_*.py
+              **/*_test.py
+              **/conftest.py
+          [report]
+          include_namespace_packages = true
+          EOF
+
+      - name: uv lock --check
+        run: uv lock --check
+
+      - name: uv sync --locked
+        id: sync
+        if: ${{ !cancelled() }}
+        run: uv sync --locked --all-extras
+
+      - name: ruff check
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: '"$RUNNER_TEMP/tool" ruff "$RUFF_VERSION" check --output-format=github .'
+
+      - name: ruff format --check
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: '"$RUNNER_TEMP/tool" ruff "$RUFF_VERSION" format --check --diff .'
+
+      - name: mypy
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: |
+          # Use [tool.mypy].files when the project sets it, else check the whole repo.
+          if python3 -c 'import sys, tomllib; c = tomllib.load(open("pyproject.toml", "rb")); sys.exit(0 if c.get("tool", {}).get("mypy", {}).get("files") else 1)'; then
+            "$RUNNER_TEMP/tool" mypy "$MYPY_VERSION"
+          else
+            "$RUNNER_TEMP/tool" mypy "$MYPY_VERSION" .
+          fi
+
+      - name: pytest (with coverage)
+        id: pytest
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run --no-sync --with "coverage==$COVERAGE_VERSION" coverage run --rcfile="$RUNNER_TEMP/coveragerc" -m pytest
+
+      - name: Diff coverage on changed lines
+        if: ${{ !cancelled() && steps.pytest.outcome != 'skipped' }}
+        run: |
+          uv run --no-sync --with "coverage==$COVERAGE_VERSION" coverage xml --rcfile="$RUNNER_TEMP/coveragerc" -o "$RUNNER_TEMP/coverage.xml"
+          uvx "diff-cover@$DIFF_COVER_VERSION" "$RUNNER_TEMP/coverage.xml" --compare-branch=HEAD^1 --fail-under="$DIFF_COVERAGE_MIN"
+
+      - name: pip-audit
+        if: ${{ !cancelled() }}
+        run: |
+          uv export --locked --all-extras --no-emit-project --no-emit-local --format requirements-txt -q -o "$RUNNER_TEMP/requirements.txt"
+          uvx "pip-audit@$PIP_AUDIT_VERSION" -r "$RUNNER_TEMP/requirements.txt" --require-hashes --disable-pip --progress-spinner off
+
+  gate:
+    name: gate
+    if: always() && github.event_name == 'pull_request'
+    needs: [common, python]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: All guardrails jobs passed
+        env:
+          COMMON: ${{ needs.common.result }}
+          PYTHON: ${{ needs.python.result }}
+          WANT_PYTHON: ${{ inputs.python }}
+        run: |
+          echo "common: $COMMON, python: $PYTHON (wanted: $WANT_PYTHON)"
+          test "$COMMON" = success
+          if [ "$WANT_PYTHON" = true ]; then test "$PYTHON" = success; fi
+
+  codeql:
+    name: codeql
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Pick languages (public repos only)
+        id: langs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          visibility=$(gh api "repos/$REPO" --jq .visibility)
+          if [ "$visibility" != public ]; then
+            echo "::notice::CodeQL skipped: $REPO is $visibility."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          langs=$(gh api "repos/$REPO/languages" --jq '
+            {"Python":"python","JavaScript":"javascript-typescript","TypeScript":"javascript-typescript",
+             "C":"c-cpp","C++":"c-cpp","Java":"java-kotlin","Kotlin":"java-kotlin","Ruby":"ruby","C#":"csharp"}
+              as $map | [keys[] | $map[.] // empty] + ["actions"] | unique | join(",")')
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "languages=$langs" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.langs.outputs.run == 'true'
+        with:
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        if: steps.langs.outputs.run == 'true'
+        with:
+          languages: ${{ steps.langs.outputs.languages }}
+          build-mode: none
+
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        if: steps.langs.outputs.run == 'true'
+
+  mutation:
+    name: mutation
+    if: inputs.python && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - run: uv sync --locked --all-extras
+
+      # Report only: survived mutants do not fail the job. A crash does.
+      - name: mutmut
+        run: |
+          mutmut() { uv run --no-sync --with "mutmut==$MUTMUT_VERSION" mutmut "$@"; }
+          mutmut run --max-children "$(nproc)"
+          mutmut export-cicd-stats
+          mutmut results > "$RUNNER_TEMP/mutants.txt"
+          {
+            echo "## Mutation test (report only)"
+            echo
+            echo "A survived mutant is a small code change that no test caught."
+            echo
+            echo "| Killed | Survived | No tests | Timeout | Total |"
+            echo "|---|---|---|---|---|"
+            jq -r '"| \(.killed) | \(.survived) | \(.no_tests) | \(.timeout) | \(.total) |"' mutants/mutmut-cicd-stats.json
+            echo
+            echo "<details><summary>First 50 survived mutants (see one with: mutmut show NAME)</summary>"
+            echo
+            echo '```'
+            grep ': survived' "$RUNNER_TEMP/mutants.txt" | head -50 || true
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
