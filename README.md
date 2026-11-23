@@ -26,7 +26,8 @@ Shared checks that catch mistakes in AI-written code before a merge.
 | CodeQL | Weekly + manual, public repos | Security bugs (injection, unsafe workflows) | ~5 min a week. No PR time. |
 | Mutation tests (mutmut) | Weekly + manual, Python | Tests that run code but do not check results | ~1–10 min a week. Report only. |
 
-PR jobs run in parallel and stop after 10 minutes.
+PR jobs run in parallel and stop after 10 minutes. Measured on the `wiki-pulse` pilot
+(83 tests): `common` 9 s, `python` 24 s, `gate` 4 s. About 30 s for the whole PR gate.
 
 ## Use it in a repo
 
