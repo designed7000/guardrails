@@ -170,3 +170,37 @@ def test_force_push_of_an_explicit_tag_is_allowed(on_feature: Path) -> None:
 )
 def test_force_push_without_explicit_tag_is_blocked(on_feature: Path, command: str) -> None:
     assert block_risky_push.check_command(command, str(on_feature)) is not None
+
+
+# The label names, built from pieces as in the other test file.
+CI_LABEL = "allow-" + "ci-change"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"gh api repos/o/r/issues/1 --jq '[.labels[].name] | index(\"{CI_LABEL}\")'",
+        f"gh pr list --label {CI_LABEL}",
+        f"gh label create {CI_LABEL} -c D93F0B --force",
+        f"gh search prs --label {CI_LABEL}",
+    ],
+)
+def test_gh_reads_and_label_creation_are_allowed(on_feature: Path, command: str) -> None:
+    assert block_risky_push.check_command(command, str(on_feature)) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"gh pr edit 3 --add-label {CI_LABEL}",
+        f"gh issue edit 3 --add-label=bug,{CI_LABEL}",
+        f"gh pr create --fill --label {CI_LABEL}",
+        f"gh pr create --fill -l {CI_LABEL}",
+        f"gh api repos/o/r/issues/3/labels -f 'labels[]={CI_LABEL}'",
+        f"gh api -X PUT repos/o/r/issues/3/labels --input labels.json  # {CI_LABEL}",
+    ],
+)
+def test_gh_adding_owner_labels_is_blocked(on_feature: Path, command: str) -> None:
+    reason = block_risky_push.check_command(command, str(on_feature))
+    assert reason is not None
+    assert "owner" in reason

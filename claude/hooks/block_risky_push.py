@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Claude Code PreToolUse hook. Stdlib only.
 
-Blocks: force pushes, pushes to main or master, and `gh` commands that add the
-owner-only labels `allow-suppression` or `allow-ci-change`.
+Blocks: force pushes, pushes to main or master, and `gh` commands that put the
+owner-only labels `allow-suppression` or `allow-ci-change` on a PR or an issue (also any
+`gh api` write to an issue's labels). Reading those labels stays allowed.
 
 Reads the hook JSON on stdin. Exit 2 blocks the Bash call and shows the reason to
 Claude. Exit 0 allows it. `--force-with-lease` stays allowed on other branches, and a
@@ -68,6 +69,46 @@ def command_word(tokens: list[str]) -> int:
 def is_gh(tokens: list[str]) -> bool:
     i = command_word(tokens)
     return i < len(tokens) and os.path.basename(tokens[i]) == "gh"
+
+
+def has_owner_label(value: str) -> bool:
+    return any(label in value for label in OWNER_LABELS)
+
+
+def flag_value(args: list[str], names: tuple[str, ...]) -> list[str]:
+    """Values of a flag, in the forms `--flag value` and `--flag=value`."""
+    values = []
+    for i, arg in enumerate(args):
+        if arg in names and i + 1 < len(args):
+            values.append(args[i + 1])
+        for name in names:
+            if arg.startswith(name + "="):
+                values.append(arg.split("=", 1)[1])
+    return values
+
+
+def gh_adds_owner_label(args: list[str]) -> bool:
+    """True when a gh command puts an owner-only label on a PR or an issue.
+
+    Reads (`gh pr list --label ...`) and `gh label create` are allowed.
+    """
+    sub = tuple(args[:2])
+    if sub in {("pr", "create"), ("issue", "create")}:
+        return any(has_owner_label(v) for v in flag_value(args, ("--label", "-l")))
+    if sub in {("pr", "edit"), ("issue", "edit")}:
+        return any(has_owner_label(v) for v in flag_value(args, ("--add-label",)))
+    if args[:1] == ["api"]:
+        path = next((a for a in args[1:] if not a.startswith("-") and "/" in a), "")
+        if not re.search(r"/issues/\d+/labels", path):
+            return False
+        method = (flag_value(args, ("-X", "--method")) or ["GET"])[-1].upper()
+        writes_body = any(
+            a in {"-f", "-F", "--field", "--raw-field", "--input"}
+            or a.startswith(("--field=", "--raw-field=", "--input="))
+            for a in args
+        )
+        return method != "GET" or writes_body
+    return False
 
 
 def split_git(tokens: list[str], cwd: str) -> tuple[str, str, list[str]] | None:
@@ -149,7 +190,7 @@ def check_command(command: str, cwd: str) -> str | None:
         if tokens[0] == "cd" and len(tokens) > 1:
             cwd = os.path.join(cwd, os.path.expanduser(tokens[1]))
             continue
-        if is_gh(tokens) and any(label in t for t in tokens for label in OWNER_LABELS):
+        if is_gh(tokens) and gh_adds_owner_label(tokens[command_word(tokens) + 1 :]):
             return "only the owner adds the labels `allow-suppression` and `allow-ci-change`"
         found = split_git(tokens, cwd)
         if found is None:
