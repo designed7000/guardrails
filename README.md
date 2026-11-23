@@ -68,8 +68,8 @@ mkdir -p ~/.claude/hooks && cp claude/hooks/block_risky_push.py ~/.claude/hooks/
 ```
 
 Then merge `claude/settings-hooks.json` into `~/.claude/settings.json`.
-If the hook file is missing, Python exits with code 2 and Claude Code blocks every Bash call.
-Keep the file in place.
+If the hook file is missing, the command exits with code 1: Claude Code shows a hook error and
+does not block. Exit code 2 (a blocked push) is the only code that blocks.
 
 ## Change the checks
 
