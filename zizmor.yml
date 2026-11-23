@@ -1,0 +1,7 @@
+# Callers use designed7000/guardrails/...@v1, a tag the owner moves (owner repos only). All other actions need a SHA.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "designed7000/*": ref-pin
+        "*": hash-pin
