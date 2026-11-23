@@ -186,6 +186,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          # GitHub language name -> CodeQL language. "actions" scans the workflow files.
+          TO_CODEQL: >-
+            {"Python":"python","JavaScript":"javascript-typescript","TypeScript":"javascript-typescript",
+            "C":"c-cpp","C++":"c-cpp","Java":"java-kotlin","Kotlin":"java-kotlin","Ruby":"ruby","C#":"csharp"}
+            as $map | [keys[] | $map[.] // empty] + ["actions"] | unique | join(",")
         run: |
           visibility=$(gh api "repos/$REPO" --jq .visibility)
           if [ "$visibility" != public ]; then
@@ -193,10 +198,7 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          langs=$(gh api "repos/$REPO/languages" --jq '
-            {"Python":"python","JavaScript":"javascript-typescript","TypeScript":"javascript-typescript",
-             "C":"c-cpp","C++":"c-cpp","Java":"java-kotlin","Kotlin":"java-kotlin","Ruby":"ruby","C#":"csharp"}
-              as $map | [keys[] | $map[.] // empty] + ["actions"] | unique | join(",")')
+          langs=$(gh api "repos/$REPO/languages" --jq "$TO_CODEQL")
           echo "run=true" >> "$GITHUB_OUTPUT"
           echo "languages=$langs" >> "$GITHUB_OUTPUT"
 
